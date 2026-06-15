@@ -1,0 +1,118 @@
+{
+  "sync_rules_version": "1.0.0",
+  "description": "智能制造数据中台 - MySQL与InfluxDB双向同步规则配置",
+  "sync_pairs": [
+    {
+      "rule_id": "RULE_DEVICE_001",
+      "rule_name": "设备基础信息同步",
+      "mysql_table": "device_info",
+      "influxdb_measurement": "device_info",
+      "sync_direction": "bidirectional",
+      "enabled": true,
+      "field_mapping": {
+        "device_id": {"type": "string", "index": true, "primary_key": true},
+        "device_name": {"type": "string", "index": true},
+        "device_type": {"type": "string", "index": false},
+        "device_status": {"type": "string", "index": true},
+        "location": {"type": "string", "index": false},
+        "install_date": {"type": "datetime", "index": false},
+        "manufacturer": {"type": "string", "index": false},
+        "model": {"type": "string", "index": false},
+        "operator": {"type": "string", "index": true}
+      },
+      "tag_fields": ["device_type", "device_status", "operator"],
+      "index_fields": ["device_id", "device_name", "device_status", "operator"]
+    },
+    {
+      "rule_id": "RULE_METRICS_002",
+      "rule_name": "设备运行指标同步",
+      "mysql_table": "device_metrics",
+      "influxdb_measurement": "device_metrics",
+      "sync_direction": "mysql_to_influx",
+      "enabled": true,
+      "field_mapping": {
+        "metric_id": {"type": "string", "index": true, "primary_key": true},
+        "device_id": {"type": "string", "index": true},
+        "metric_type": {"type": "string", "index": true},
+        "metric_value": {"type": "float", "index": false},
+        "metric_unit": {"type": "string", "index": false},
+        "collect_time": {"type": "datetime", "index": true},
+        "quality_flag": {"type": "string", "index": true}
+      },
+      "tag_fields": ["device_id", "metric_type", "quality_flag"],
+      "index_fields": ["metric_id", "device_id", "metric_type", "collect_time", "quality_flag"]
+    },
+    {
+      "rule_id": "RULE_ALERT_003",
+      "rule_name": "设备告警记录同步",
+      "mysql_table": "device_alerts",
+      "influxdb_measurement": "device_alerts",
+      "sync_direction": "bidirectional",
+      "enabled": true,
+      "field_mapping": {
+        "alert_id": {"type": "string", "index": true, "primary_key": true},
+        "device_id": {"type": "string", "index": true},
+        "alert_type": {"type": "string", "index": true},
+        "alert_level": {"type": "string", "index": true},
+        "alert_message": {"type": "string", "index": false},
+        "alert_time": {"type": "datetime", "index": true},
+        "acknowledged": {"type": "boolean", "index": true},
+        "resolved": {"type": "boolean", "index": true},
+        "resolve_time": {"type": "datetime", "index": false},
+        "operator": {"type": "string", "index": true}
+      },
+      "tag_fields": ["device_id", "alert_type", "alert_level", "acknowledged", "resolved", "operator"],
+      "index_fields": ["alert_id", "device_id", "alert_type", "alert_level", "alert_time", "operator"]
+    }
+  ],
+  "whitelist": {
+    "enabled": false,
+    "tables": [],
+    "measurements": []
+  },
+  "blacklist": {
+    "enabled": true,
+    "tables": ["sys_config", "user_permissions", "sync_log", "backup_tables"],
+    "measurements": ["_internal", "system_monitor"],
+    "fields": ["password_hash", "secret_key", "private_key", "token"]
+  },
+  "type_mapping": {
+    "mysql_to_influx": {
+      "VARCHAR": "string",
+      "CHAR": "string",
+      "TEXT": "string",
+      "MEDIUMTEXT": "string",
+      "LONGTEXT": "string",
+      "INT": "int",
+      "INTEGER": "int",
+      "BIGINT": "int",
+      "SMALLINT": "int",
+      "TINYINT": "int",
+      "FLOAT": "float",
+      "DOUBLE": "float",
+      "DECIMAL": "float",
+      "BOOL": "boolean",
+      "BOOLEAN": "boolean",
+      "TINYINT(1)": "boolean",
+      "DATETIME": "datetime",
+      "TIMESTAMP": "datetime",
+      "DATE": "datetime",
+      "JSON": "string",
+      "BLOB": "string",
+      "DEFAULT": "string"
+    },
+    "influx_to_mysql": {
+      "string": "VARCHAR(512)",
+      "int": "BIGINT",
+      "float": "DOUBLE",
+      "boolean": "TINYINT(1)",
+      "datetime": "DATETIME(3)",
+      "DEFAULT": "TEXT"
+    }
+  },
+  "sync_schedule": {
+    "cron_expression": "0 */5 * * * *",
+    "description": "每5分钟执行一次同步",
+    "timezone": "Asia/Shanghai"
+  }
+}
