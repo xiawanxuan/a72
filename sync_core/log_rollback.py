@@ -26,6 +26,7 @@ class SyncPhase(str, Enum):
     """同步阶段枚举"""
     INIT = "init"
     CONNECT = "connect"
+    CAPACITY_CHECK = "capacity_check"
     COLLECT = "collect"
     DIFF = "diff"
     GENERATE_SCRIPT = "generate_script"

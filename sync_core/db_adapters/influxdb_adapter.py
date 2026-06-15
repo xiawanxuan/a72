@@ -351,6 +351,245 @@ class InfluxDBAdapter:
             logger.error(f"删除 measurement 失败 [{measurement}]: {e}", exc_info=True)
             raise
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def fetch_bucket_retention(self, bucket: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取 bucket 的保留策略和存储配额
+        复用原有的 buckets_api 元数据通路，不新增网络层
+        """
+        bucket = bucket or self.config.get("bucket", "")
+        org = self.config.get("org", "")
+        try:
+            buckets = self.buckets_api.find_buckets(name=bucket)
+            if not buckets or not buckets.buckets:
+                logger.warning(f"未找到 bucket: {bucket}")
+                return {"bucket": bucket, "exists": False}
+            b = buckets.buckets[0]
+            retention_seconds = None
+            if b.retention_rules:
+                retention_seconds = b.retention_rules[0].every_seconds
+            return {
+                "bucket": bucket,
+                "exists": True,
+                "bucket_id": b.id,
+                "org": org,
+                "retention_seconds": retention_seconds,
+                "retention_days": round(retention_seconds / 86400, 2) if retention_seconds else None,
+                "retention_policy": b.retention_rules[0].type if b.retention_rules else "forever",
+                "description": b.description,
+                "created_at": b.created_at.isoformat() if b.created_at else None
+            }
+        except Exception as e:
+            logger.error(f"获取 bucket 保留策略失败 [{bucket}]: {e}", exc_info=True)
+            return {"bucket": bucket, "exists": False, "error": str(e)}
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def fetch_measurement_series_count(self, measurement: str,
+                                         bucket: Optional[str] = None,
+                                         time_range_hours: int = 24) -> Dict[str, Any]:
+        """
+        获取指定 measurement 的时序数据规模（行数、基数）
+        复用原有的 execute_flux 通路，不新增网络层
+        """
+        bucket = bucket or self.config.get("bucket", "")
+        org = self.config.get("org", "")
+
+        count_query = f'''
+        from(bucket: "{bucket}")
+          |> range(start: -{time_range_hours}h, stop: now())
+          |> filter(fn: (r) => r._measurement == "{measurement}")
+          |> count()
+          |> group(columns: ["_measurement"])
+          |> sum()
+        '''
+
+        cardinality_query = f'''
+        import "influxdata/influxdb"
+        influxdb.cardinality(
+          bucket: "{bucket}",
+          start: -{time_range_hours}h,
+          predicate: (r) => r._measurement == "{measurement}"
+        )
+        '''
+
+        size_query = f'''
+        from(bucket: "{bucket}")
+          |> range(start: -{time_range_hours}h, stop: now())
+          |> filter(fn: (r) => r._measurement == "{measurement}")
+          |> map(fn: (r) => ({{ r with _value: float(v: r._value) * 0.0 + 1.0 }}))
+          |> sum()
+          |> group()
+          |> sum()
+          |> map(fn: (r) => ({{ _value: r._value * 256.0 }}))
+        '''
+
+        result = {
+            "measurement": measurement,
+            "bucket": bucket,
+            "time_range_hours": time_range_hours,
+            "series_count": 0,
+            "point_count": 0,
+            "estimated_size_bytes": 0,
+            "cardinality": 0
+        }
+
+        try:
+            count_records = self.execute_flux(count_query, org)
+            for r in count_records:
+                result["point_count"] += r.get("_value", 0)
+        except Exception as e:
+            logger.warning(f"获取数据行数失败 [{measurement}]: {e}")
+
+        try:
+            card_records = self.execute_flux(cardinality_query, org)
+            for r in card_records:
+                result["cardinality"] += r.get("_value", 0)
+        except Exception as e:
+            logger.warning(f"获取基数失败 [{measurement}]: {e}")
+
+        try:
+            size_records = self.execute_flux(size_query, org)
+            for r in size_records:
+                result["estimated_size_bytes"] = max(result["estimated_size_bytes"],
+                                                    int(r.get("_value", 0)))
+        except Exception as e:
+            if result["point_count"] > 0:
+                result["estimated_size_bytes"] = result["point_count"] * 256
+            logger.warning(f"估算大小失败 [{measurement}]: {e}")
+
+        if result["estimated_size_bytes"] == 0 and result["point_count"] > 0:
+            result["estimated_size_bytes"] = result["point_count"] * 256
+
+        result["estimated_size_mb"] = round(result["estimated_size_bytes"] / (1024 * 1024), 2)
+        result["estimated_size_gb"] = round(result["estimated_size_bytes"] / (1024 * 1024 * 1024), 4)
+        result["avg_bytes_per_point"] = (
+            round(result["estimated_size_bytes"] / result["point_count"], 1)
+            if result["point_count"] > 0 else 0
+        )
+
+        logger.info(f"时序规模统计 [{measurement}]: "
+                    f"{result['point_count']} 点, "
+                    f"基数={result['cardinality']}, "
+                    f"预估 {result['estimated_size_mb']} MB "
+                    f"({time_range_hours}h)")
+        return result
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def fetch_disk_usage(self, bucket: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取 bucket 磁盘使用量和配额限制
+        复用原有的 execute_flux 通路
+        """
+        bucket = bucket or self.config.get("bucket", "")
+        org = self.config.get("org", "")
+
+        usage_query = f'''
+        import "influxdata/influxdb/v1"
+
+        totalSize = from(bucket: "{bucket}")
+          |> range(start: 0, stop: now())
+          |> filter(fn: (r) => r._field != "")
+          |> group()
+          |> count()
+          |> map(fn: (r) => ({{ _value: r._value * 256.0 }}))
+          |> sum()
+          |> findColumn(fn: (key) => true, column: "_value")
+
+        {{ "bucket": "{bucket}", "estimated_usage_bytes": if length(totalSize) > 0 then totalSize[0] else 0.0 }}
+        '''
+
+        try:
+            size_query = f'''
+            from(bucket: "{bucket}")
+              |> range(start: 0, stop: now())
+              |> count()
+              |> group()
+              |> sum()
+              |> map(fn: (r) => ({{ _value: r._value * 256.0 }}))
+            '''
+            records = self.execute_flux(size_query, org)
+            total_bytes = 0
+            for r in records:
+                total_bytes += int(r.get("_value", 0))
+        except Exception as e:
+            logger.warning(f"获取磁盘使用量失败: {e}")
+            total_bytes = 0
+
+        retention = self.fetch_bucket_retention(bucket)
+        retention_seconds = retention.get("retention_seconds")
+        quota_bytes = None
+        if retention_seconds:
+            daily_bytes = total_bytes / max(retention_seconds / 86400, 1)
+            quota_bytes = int(daily_bytes * (retention_seconds / 86400) * 1.2)
+
+        disk_stats = {
+            "bucket": bucket,
+            "org": org,
+            "estimated_usage_bytes": total_bytes,
+            "estimated_usage_mb": round(total_bytes / (1024 * 1024), 2),
+            "estimated_usage_gb": round(total_bytes / (1024 * 1024 * 1024), 4),
+            "retention_seconds": retention_seconds,
+            "retention_days": retention.get("retention_days"),
+            "quota_bytes": quota_bytes,
+            "quota_gb": round(quota_bytes / (1024 * 1024 * 1024), 4) if quota_bytes else None,
+            "usage_percent": (
+                round(total_bytes / quota_bytes * 100, 2)
+                if quota_bytes and quota_bytes > 0 else None
+            )
+        }
+
+        logger.info(f"磁盘使用统计 [{bucket}]: "
+                    f"{disk_stats['estimated_usage_gb']} GB / "
+                    f"{disk_stats.get('quota_gb', '∞')} GB "
+                    f"(使用率 {disk_stats.get('usage_percent', 'N/A')}%)")
+        return disk_stats
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def fetch_mysql_row_count(self, mysql_table: str,
+                               mysql_adapter=None) -> Dict[str, Any]:
+        """
+        获取 MySQL 业务表行数（供跨库规模估算使用）
+        复用传入的 MySQLAdapter 实例，不新增连接
+        """
+        if not mysql_adapter:
+            return {"table": mysql_table, "error": "未提供 MySQL 适配器"}
+        try:
+            sql = f"SELECT COUNT(*) AS total FROM `{mysql_table}`"
+            rows = mysql_adapter.execute_query(sql)
+            total = rows[0]["total"] if rows else 0
+
+            size_sql = f"""
+            SELECT ROUND(((data_length + index_length) / 1024 / 1024), 2) AS size_mb
+            FROM information_schema.TABLES
+            WHERE table_schema = DATABASE() AND table_name = '{mysql_table}'
+            """
+            size_rows = mysql_adapter.execute_query(size_sql)
+            size_mb = size_rows[0]["size_mb"] if size_rows else 0
+
+            stats = {
+                "table": mysql_table,
+                "row_count": total,
+                "size_mb": float(size_mb) if size_mb else 0,
+                "avg_row_bytes": int(size_mb * 1024 * 1024 / total) if total > 0 else 0
+            }
+            logger.info(f"MySQL 表规模统计 [{mysql_table}]: {total} 行, {stats['size_mb']} MB")
+            return stats
+        except Exception as e:
+            logger.warning(f"获取 MySQL 表大小失败 [{mysql_table}]: {e}")
+            return {"table": mysql_table, "row_count": 0, "size_mb": 0, "error": str(e)}
+
     def close(self):
         """关闭客户端"""
         if self._write_api:

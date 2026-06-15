@@ -215,6 +215,25 @@ class MySQLAdapter:
             logger.error(f"执行 DDL 失败: {ddl_sql[:150]}..., 错误: {e}", exc_info=True)
             raise
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def execute_query(self, query_sql: str) -> List[Dict[str, Any]]:
+        """
+        执行 SELECT 查询语句，返回字典列表
+        复用原有的 engine 连接池，不新增网络层
+        """
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query_sql))
+                rows = [dict(row._mapping) for row in result]
+                logger.debug(f"执行查询成功，返回 {len(rows)} 行: {query_sql[:150]}...")
+                return rows
+        except Exception as e:
+            logger.error(f"执行查询失败: {query_sql[:150]}..., 错误: {e}", exc_info=True)
+            raise
+
     def begin_transaction(self):
         """开始事务"""
         if not self._connection:

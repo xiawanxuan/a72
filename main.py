@@ -30,6 +30,8 @@ from sync_core.sync_executor import (ScriptGenerator, GenerateResult,
 from sync_core.sync_filter import (SyncFilter, FilterTarget, resolve_filter,
                                    apply_filter_to_diff, apply_filter_to_generate,
                                    build_filter_diagnostic)
+from sync_core.sync_capacity_checker import (CapacityChecker, CapacityCheckResult,
+                                             CapacityThresholds, CapacityStatus)
 
 logger = logging.getLogger("main")
 
@@ -39,11 +41,15 @@ class SyncOrchestrator:
 
     def __init__(self, run_mode: Optional[RunMode] = None,
                  sync_filter: Optional[SyncFilter] = None,
+                 skip_capacity_check: bool = False,
+                 capacity_threshold_pct: Optional[float] = None,
                  db_config_path: str = "config/db_config.ini",
                  rules_path: str = "config/sync_rules.json"):
         self.db_config_path = db_config_path
         self.rules_path = rules_path
         self.sync_filter = sync_filter
+        self.skip_capacity_check = skip_capacity_check
+        self.capacity_threshold_pct = capacity_threshold_pct
 
         self.log_mgr = LogManager()
         self.config = ConfigManager(rules_path, db_config_path)
@@ -101,6 +107,38 @@ class SyncOrchestrator:
 
         try:
             self._init_connections()
+            capacity_result: Optional[CapacityCheckResult] = None
+
+            with self.session_mgr.phase(SyncPhase.CAPACITY_CHECK):
+                capacity_checker = CapacityChecker(
+                    self.mysql, self.influx, self.config,
+                    metadata_collector=self.collector,
+                    sync_filter=self.sync_filter
+                )
+                thresholds = CapacityThresholds.from_args(self.capacity_threshold_pct)
+                capacity_result = capacity_checker.check(
+                    thresholds=thresholds,
+                    skip_check=self.skip_capacity_check,
+                    log_fn=self.session_mgr.log
+                )
+                if not capacity_result.can_proceed:
+                    block_msg = (
+                        f"容量校验拦截，原因: {len(capacity_result.blocked_reasons)} 条。 "
+                        f"如需跳过请使用 --skip-capacity-check"
+                    )
+                    self.session_mgr.log(
+                        phase=SyncPhase.FAILED, level=LogLevel.CRITICAL,
+                        message=block_msg
+                    )
+                    success = False
+                    errors.extend(capacity_result.blocked_reasons)
+                    return {
+                        "session_id": session.session_id,
+                        "status": "blocked_by_capacity",
+                        "capacity_check": capacity_result.to_dict(),
+                        "message": block_msg,
+                        "blocked_reasons": capacity_result.blocked_reasons
+                    }
 
             with self.session_mgr.phase(SyncPhase.COLLECT):
                 collect_result: CollectResult = self.collector.collect_all()
@@ -166,6 +204,7 @@ class SyncOrchestrator:
                 return {
                     "session_id": session.session_id,
                     "status": "no_diff",
+                    "capacity_check": capacity_result.to_dict(),
                     "collect_stats": collect_result.stats,
                     "diff_summary": diff_result.summary(),
                     "filter": filter_desc,
@@ -183,6 +222,7 @@ class SyncOrchestrator:
                 "status": "success" if success else ("rollback" if exec_result.rollback_triggered else "partial"),
                 "run_mode": self.run_mode.value,
                 "filter": filter_desc,
+                "capacity_check": capacity_result.to_dict(),
                 "collect_stats": collect_result.stats,
                 "diff_summary": diff_result.summary(),
                 "script_summary": gen_result.summary(),
@@ -206,6 +246,7 @@ class SyncOrchestrator:
                 "status": "failed",
                 "run_mode": self.run_mode.value,
                 "filter": filter_desc,
+                "capacity_check": capacity_result.to_dict() if capacity_result else None,
                 "errors": errors,
                 "message": f"同步失败: {e}"
             }
@@ -232,10 +273,15 @@ def cmd_preview(args):
     logger.info("运行模式: PREVIEW (仅预览，不实际执行变更)")
     logger.info("=" * 60)
     sf = resolve_filter(args)
-    orch = SyncOrchestrator(run_mode=RunMode.PREVIEW, sync_filter=sf)
+    orch = SyncOrchestrator(
+        run_mode=RunMode.PREVIEW,
+        sync_filter=sf,
+        skip_capacity_check=getattr(args, 'skip_capacity_check', False),
+        capacity_threshold_pct=getattr(args, 'capacity_threshold_pct', None)
+    )
     result = orch.run_sync(export_scripts=True)
     print_result(result)
-    return 0 if result["status"] != "failed" else 1
+    return 0 if result["status"] not in ("failed", "blocked_by_capacity") else 1
 
 
 def cmd_execute(args):
@@ -249,10 +295,15 @@ def cmd_execute(args):
             logger.info("用户取消操作")
             return 0
     sf = resolve_filter(args)
-    orch = SyncOrchestrator(run_mode=RunMode.EXECUTE, sync_filter=sf)
+    orch = SyncOrchestrator(
+        run_mode=RunMode.EXECUTE,
+        sync_filter=sf,
+        skip_capacity_check=getattr(args, 'skip_capacity_check', False),
+        capacity_threshold_pct=getattr(args, 'capacity_threshold_pct', None)
+    )
     result = orch.run_sync(export_scripts=True)
     print_result(result)
-    return 0 if result["status"] == "success" else 1
+    return 0 if result["status"] in ("success", "no_diff") else 1
 
 
 def cmd_status(args):
@@ -389,6 +440,58 @@ def print_result(result: dict):
     if result.get("message"):
         print(f"  说明:       {result['message']}")
 
+    if result.get("capacity_check"):
+        print("\n  --- 容量校验 ---")
+        cc = result["capacity_check"]
+        status_map = {
+            "safe": "✅ 安全",
+            "warning": "⚠️  警告",
+            "blocked": "🚫 拦截",
+            "skipped": "⏭  跳过",
+            "error": "❌ 错误"
+        }
+        status = status_map.get(cc.get("status"), cc.get("status"))
+        print(f"    校验状态:   {status}")
+        print(f"    可执行:     {'是' if cc.get('can_proceed') else '否'}")
+        print(f"    校验耗时:   {cc.get('check_duration_ms', 0)} ms")
+        du = cc.get("disk_usage", {})
+        print(f"    磁盘使用:   {du.get('estimated_usage_gb', 'N/A')} GB / "
+              f"{du.get('quota_gb', '∞')} GB "
+              f"({du.get('usage_percent', 'N/A')}%)")
+        th = cc.get("thresholds", {})
+        print(f"    软阈值:     {th.get('soft_warning_pct')}%")
+        print(f"    硬阈值:     {th.get('hard_block_pct')}%")
+        if cc.get("total_estimated_increment_gb", 0) > 0:
+            print(f"    同步增量:   {cc.get('total_estimated_increment_gb'):.6f} GB")
+            print(f"    同步后预估: {cc.get('usage_percent_after_sync'):.2f}%")
+        if cc.get("warnings"):
+            print(f"    警告 ({len(cc['warnings'])} 条):")
+            for w in cc["warnings"][:5]:
+                print(f"      ⚠️  {w[:120]}")
+        if cc.get("blocked_reasons"):
+            print(f"    拦截原因 ({len(cc['blocked_reasons'])} 条):")
+            for r in cc["blocked_reasons"][:10]:
+                print(f"      🚫 {r[:120]}")
+        if cc.get("table_stats"):
+            print(f"    明细 ({len(cc['table_stats'])} 个同步对规模):")
+            for ts in cc["table_stats"][:8]:
+                direction_map = {
+                    "mysql_to_influx": "→",
+                    "influx_to_mysql": "←",
+                    "bidirectional": "⇄"
+                }
+                d = direction_map.get(ts.get("sync_direction"), "?")
+                src = ts.get("source_type", "")
+                name = ts.get("name", "")
+                paired = ts.get("paired_name", "")
+                rows = ts.get("row_count", 0)
+                size_gb = ts.get("size_gb", 0)
+                inc_gb = ts.get("estimated_increment_gb", 0)
+                print(f"      · [{src}] {name} {d} {paired}: "
+                      f"{rows:,} 行, "
+                      f"{size_gb:.6f} GB, "
+                      f"增量 {inc_gb:.6f} GB")
+
     if result.get("collect_stats"):
         print("\n  --- 元数据采集 ---")
         for k, v in result["collect_stats"].items():
@@ -476,6 +579,15 @@ def _add_filter_args(parser: argparse.ArgumentParser):
         help="按差异类型过滤（可重复，逗号分隔）。"
              "可选: field_add,field_drop,field_type_change,field_nullable_change,"
              "tag_add,tag_drop,index_add,index_drop,index_column_change,primary_key_change")
+
+    cg = parser.add_argument_group("容量校验参数", "同步前置时序数据容量校验，防止磁盘溢出")
+    cg.add_argument(
+        "--skip-capacity-check", action="store_true", default=False,
+        help="跳过容量校验（慎用！可能导致磁盘溢出）")
+    cg.add_argument(
+        "--capacity-threshold-pct", type=float, default=None, metavar="PCT",
+        help="自定义磁盘使用率硬拦截阈值(百分比，默认90)。"
+             "例如 --capacity-threshold-pct 85 表示使用率超过85%时拦截")
 
 
 def build_parser() -> argparse.ArgumentParser:
