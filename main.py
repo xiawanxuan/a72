@@ -27,6 +27,9 @@ from sync_core.log_rollback import (LogManager, SessionManager, RollbackEngine,
                                     SyncPhase, LogLevel)
 from sync_core.sync_executor import (ScriptGenerator, GenerateResult,
                                      SyncExecutor, ExecuteResult)
+from sync_core.sync_filter import (SyncFilter, FilterTarget, resolve_filter,
+                                   apply_filter_to_diff, apply_filter_to_generate,
+                                   build_filter_diagnostic)
 
 logger = logging.getLogger("main")
 
@@ -35,10 +38,12 @@ class SyncOrchestrator:
     """同步流程编排器"""
 
     def __init__(self, run_mode: Optional[RunMode] = None,
+                 sync_filter: Optional[SyncFilter] = None,
                  db_config_path: str = "config/db_config.ini",
                  rules_path: str = "config/sync_rules.json"):
         self.db_config_path = db_config_path
         self.rules_path = rules_path
+        self.sync_filter = sync_filter
 
         self.log_mgr = LogManager()
         self.config = ConfigManager(rules_path, db_config_path)
@@ -83,10 +88,16 @@ class SyncOrchestrator:
             )
 
     def run_sync(self, export_scripts: bool = True) -> dict:
-        """执行完整同步流程"""
+        """执行完整同步流程（含过滤层）"""
         session = self.session_mgr.start_session()
         success = False
         errors = []
+        active_filter = self.sync_filter
+
+        filter_desc = active_filter.describe() if active_filter else "无过滤(全量)"
+        self.session_mgr.log(
+            phase=SyncPhase.INIT, level=LogLevel.INFO,
+            message=f"同步过滤条件: {filter_desc}")
 
         try:
             self._init_connections()
@@ -102,8 +113,28 @@ class SyncOrchestrator:
                 if diff_result.errors:
                     errors.extend(diff_result.errors)
 
+            with self.session_mgr.phase(SyncPhase.DIFF):
+                if active_filter and not active_filter.is_empty:
+                    diff_before = diff_result.summary()
+                    diff_result = apply_filter_to_diff(diff_result, active_filter)
+                    diff_after = diff_result.summary()
+                    self.session_mgr.log(
+                        phase=SyncPhase.DIFF, level=LogLevel.INFO,
+                        message=f"差异过滤: 对数 {diff_before.get('total_pairs')}->{diff_after.get('total_pairs')}, "
+                                f"差异数 {diff_before.get('total_diffs')}->{diff_after.get('total_diffs')}")
+                    self.session_mgr.set_diff_summary(diff_after)
+
             with self.session_mgr.phase(SyncPhase.GENERATE_SCRIPT):
                 gen_result: GenerateResult = self.script_gen.generate_all(diff_result)
+
+                if active_filter and not active_filter.is_empty:
+                    gen_before = gen_result.summary()
+                    gen_result = apply_filter_to_generate(gen_result, active_filter)
+                    gen_after = gen_result.summary()
+                    self.session_mgr.log(
+                        phase=SyncPhase.GENERATE_SCRIPT, level=LogLevel.INFO,
+                        message=f"脚本过滤: {gen_before.get('total')}->{gen_after.get('total')}")
+
                 if export_scripts:
                     try:
                         paths = self.script_gen.export_scripts_to_disk(gen_result)
@@ -116,17 +147,30 @@ class SyncOrchestrator:
                         logger.warning(f"导出脚本失败: {e}")
 
             if not gen_result.all_scripts and not gen_result.create_table_scripts:
+                msg = "未发现需要同步的差异，流程结束"
+                diag = None
+                if active_filter and not active_filter.is_empty:
+                    diag = build_filter_diagnostic(
+                        self.diff_engine.analyze(collect_result), active_filter)
+                    msg = (f"过滤后无匹配差异。过滤条件: {filter_desc}。"
+                           f"过滤前共 {diag.get('total_pairs_before_filter', 0)} 对, "
+                           f"过滤后 0 对。")
+                    mismatch_details = diag.get("filter_match_details", [])
+                    if mismatch_details:
+                        msg += f" 排除原因示例: {mismatch_details[0].get('mismatch_reasons', [])[:2]}"
+
                 self.session_mgr.log(
                     phase=SyncPhase.COMPLETE, level=LogLevel.INFO,
-                    message="未发现需要同步的差异，流程结束"
-                )
+                    message=msg)
                 success = True
                 return {
                     "session_id": session.session_id,
                     "status": "no_diff",
                     "collect_stats": collect_result.stats,
                     "diff_summary": diff_result.summary(),
-                    "message": "未发现需要同步的差异"
+                    "filter": filter_desc,
+                    "filter_diagnostic": diag,
+                    "message": msg
                 }
 
             with self.session_mgr.phase(
@@ -138,6 +182,7 @@ class SyncOrchestrator:
                 "session_id": session.session_id,
                 "status": "success" if success else ("rollback" if exec_result.rollback_triggered else "partial"),
                 "run_mode": self.run_mode.value,
+                "filter": filter_desc,
                 "collect_stats": collect_result.stats,
                 "diff_summary": diff_result.summary(),
                 "script_summary": gen_result.summary(),
@@ -160,6 +205,7 @@ class SyncOrchestrator:
                 "session_id": session.session_id if session else None,
                 "status": "failed",
                 "run_mode": self.run_mode.value,
+                "filter": filter_desc,
                 "errors": errors,
                 "message": f"同步失败: {e}"
             }
@@ -185,7 +231,8 @@ def cmd_preview(args):
     logger.info("=" * 60)
     logger.info("运行模式: PREVIEW (仅预览，不实际执行变更)")
     logger.info("=" * 60)
-    orch = SyncOrchestrator(run_mode=RunMode.PREVIEW)
+    sf = resolve_filter(args)
+    orch = SyncOrchestrator(run_mode=RunMode.PREVIEW, sync_filter=sf)
     result = orch.run_sync(export_scripts=True)
     print_result(result)
     return 0 if result["status"] != "failed" else 1
@@ -201,7 +248,8 @@ def cmd_execute(args):
         if confirm not in ("y", "yes"):
             logger.info("用户取消操作")
             return 0
-    orch = SyncOrchestrator(run_mode=RunMode.EXECUTE)
+    sf = resolve_filter(args)
+    orch = SyncOrchestrator(run_mode=RunMode.EXECUTE, sync_filter=sf)
     result = orch.run_sync(export_scripts=True)
     print_result(result)
     return 0 if result["status"] == "success" else 1
@@ -336,6 +384,8 @@ def print_result(result: dict):
     print(f"  会话ID:     {result.get('session_id')}")
     print(f"  最终状态:   {result.get('status')}")
     print(f"  运行模式:   {result.get('run_mode', 'N/A')}")
+    if result.get("filter"):
+        print(f"  过滤条件:   {result['filter']}")
     if result.get("message"):
         print(f"  说明:       {result['message']}")
 
@@ -389,7 +439,43 @@ def print_result(result: dict):
         for e in result["errors"]:
             print(f"    ❌ {e}")
 
+    if result.get("filter_diagnostic"):
+        print("\n  --- 过滤诊断（为何无匹配结果）---")
+        diag = result["filter_diagnostic"]
+        print(f"    过滤前同步对数: {diag.get('total_pairs_before_filter', 0)}")
+        print(f"    过滤前未配对数: {diag.get('total_unpaired_before_filter', 0)}")
+        for detail in diag.get("filter_match_details", [])[:5]:
+            print(f"    · [{detail.get('mysql_table')} ⇄ {detail.get('influx_measurement')}]"
+                  f" 规则={detail.get('rule_id')}")
+            for reason in detail.get("mismatch_reasons", [])[:3]:
+                print(f"      ✗ {reason}")
+
     print("=" * 70)
+
+
+def _add_filter_args(parser: argparse.ArgumentParser):
+    """为子命令添加统一的过滤参数组"""
+    fg = parser.add_argument_group("过滤参数", "多条件组合为 AND 关系，同条件多值为 OR 关系")
+    fg.add_argument(
+        "--rule", "-r", action="append", default=[], metavar="RULE_ID",
+        help="按规则ID过滤（可重复，逗号分隔），优先级最高")
+    fg.add_argument(
+        "--table", "-t", action="append", default=[], metavar="TABLE",
+        help="按MySQL表名过滤（可重复，逗号分隔）")
+    fg.add_argument(
+        "--measurement", "-m", action="append", default=[], metavar="MEASUREMENT",
+        help="按InfluxDB measurement名过滤（可重复，逗号分隔）")
+    fg.add_argument(
+        "--direction", "-d", choices=["mysql_to_influx", "influx_to_mysql", "bidirectional"],
+        help="按同步方向过滤")
+    fg.add_argument(
+        "--target", choices=["mysql", "influxdb", "both"], default="both",
+        help="按脚本目标库过滤: mysql仅MySQL侧, influxdb仅InfluxDB侧 (默认both)")
+    fg.add_argument(
+        "--diff-type", action="append", default=[], metavar="DIFF_TYPE",
+        help="按差异类型过滤（可重复，逗号分隔）。"
+             "可选: field_add,field_drop,field_type_change,field_nullable_change,"
+             "tag_add,tag_drop,index_add,index_drop,index_column_change,primary_key_change")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -399,23 +485,34 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python main.py preview                预览同步变更（生成脚本不执行）
-  python main.py execute                执行同步变更（交互式确认）
-  python main.py execute -y             执行同步变更（跳过确认）
-  python main.py status                 查看最近同步状态
-  python main.py show <session_id>      查看指定同步会话详情
-  python main.py list-rules             列出同步规则
-  python main.py test-conn              测试数据库连接
-  python main.py set-mode preview       设置默认运行模式为预览
+  python main.py preview                                  预览全量同步变更
+  python main.py preview --rule RULE_DEVICE_001           仅预览指定规则
+  python main.py preview --table device_info,device_metrics  按MySQL表名过滤
+  python main.py preview --direction bidirectional        仅预览双向同步
+  python main.py preview --target mysql --diff-type field_add  MySQL侧新增字段
+  python main.py preview -r R1 -r R2 --target influxdb   多规则+目标库组合过滤
+  python main.py execute -y                               执行全量同步（跳过确认）
+  python main.py execute --rule RULE_METRICS_002 -y       仅执行指定规则
+  python main.py status                                   查看最近同步状态
+  python main.py show <session_id>                        查看指定同步会话详情
+  python main.py list-rules                               列出同步规则
+  python main.py test-conn                                测试数据库连接
+  python main.py set-mode preview                         设置默认运行模式为预览
+
+过滤参数优先级（从高到低）:
+  --rule > --table/--measurement > --direction > --target > --diff-type
+  多条件之间 AND 组合，同条件内多值 OR 组合
         """
     )
     sub = p.add_subparsers(dest="command", required=True)
 
     p_prev = sub.add_parser("preview", help="预览同步变更（生成脚本不执行）")
+    _add_filter_args(p_prev)
     p_prev.set_defaults(func=cmd_preview)
 
     p_exec = sub.add_parser("execute", help="执行同步变更（失败自动回滚）")
     p_exec.add_argument("-y", "--yes", action="store_true", help="跳过交互式确认")
+    _add_filter_args(p_exec)
     p_exec.set_defaults(func=cmd_execute)
 
     p_stat = sub.add_parser("status", help="查看最近同步状态")
